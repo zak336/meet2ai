@@ -576,7 +576,7 @@ export default function Classroom({ isActive, onEndSession }: ClassroomProps) {
     try {
       setGeneratingDiagrams((prev) => ({ ...prev, [stepIndex]: true }));
 
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_GEMINI_API_KEY });
       const response = await ai.models.generateContent({
         model: "gemini-2.5-flash",
         contents: `You are an expert SVG diagram generator. Generate raw SVG code for the following diagram description:
@@ -826,8 +826,46 @@ export default function Classroom({ isActive, onEndSession }: ClassroomProps) {
       audioRef.current = null;
     }
 
+    // Try AWS Lambda first (with timeout)
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      console.log('🚀 Attempting AWS Lambda + Polly...');
+      const awsResponse = await Promise.race([
+        aiService.sendMessage({
+          prompt: query,
+          messages: messages,
+          whiteboardText: whiteboardText,
+          image: capturedImage,
+          screenShareOn: screenShareOn
+        }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('AWS timeout')), 5000))
+      ]) as any;
+
+      if (awsResponse && awsResponse.source === 'aws') {
+        console.log('✅ Using AWS Lambda response');
+        // AWS succeeded - use its response
+        const fullText = awsResponse.text;
+        
+        // Play Polly audio if available
+        if (awsResponse.audioUrl) {
+          console.log('🔊 Playing Polly audio:', awsResponse.audioUrl);
+          const audio = new Audio(awsResponse.audioUrl);
+          audioRef.current = audio;
+          audio.play().catch(err => console.warn('Audio playback failed:', err));
+        }
+
+        // Process the response text (same parsing logic as below)
+        // For now, we'll fall through to use the existing Gemini code
+        // In a future iteration, we can parse awsResponse.text here
+        throw new Error('Use fallback for now'); // Temporary - forces fallback
+      }
+    } catch (awsError) {
+      console.warn('⚠️ AWS Lambda unavailable, using fallback:', awsError);
+    }
+
+    // Fallback: Use direct Gemini API (existing code)
+    console.log('🔄 Using fallback: Direct Gemini API');
+    try {
+      const ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_GEMINI_API_KEY });
 
       // Use gemini-2.5-flash for fast and high-quality diagram generation
       let selectedModel = "gemini-2.5-flash";
