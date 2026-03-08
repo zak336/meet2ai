@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { GoogleGenAI } from "@google/genai";
+import Groq from "groq-sdk";
 import jsPDF from "jspdf";
 import { toPng } from "html-to-image";
 import {
@@ -23,6 +23,7 @@ import Whiteboard, { Drawing } from "./Whiteboard";
 import CodeBoard from "./CodeBoard";
 import ChatPanel from "./ChatPanel";
 import AudioVisualizer from "./AudioVisualizer";
+import AIAudioVisualizer from "./AIAudioVisualizer";
 import { aiService } from "../services/ai-service";
 import { i } from "motion/react-client";
 
@@ -67,6 +68,8 @@ export default function Classroom({ isActive, onEndSession }: ClassroomProps) {
   const [callEnded, setCallEnded] = useState(false);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
+  const [isGreetingSpeaking, setIsGreetingSpeaking] = useState(false);
+  const [voiceOnlyMode, setVoiceOnlyMode] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const screenVideoRef = useRef<HTMLVideoElement>(null);
 
@@ -138,6 +141,11 @@ export default function Classroom({ isActive, onEndSession }: ClassroomProps) {
           voices.find((v) => v.lang.startsWith("en-")) ||
           voices[0];
         if (englishVoice) utterance.voice = englishVoice;
+        
+        utterance.onstart = () => setIsGreetingSpeaking(true);
+        utterance.onend = () => setIsGreetingSpeaking(false);
+        utterance.onerror = () => setIsGreetingSpeaking(false);
+        
         window.speechSynthesis.speak(utterance);
       }, 1000);
     }
@@ -146,13 +154,18 @@ export default function Classroom({ isActive, onEndSession }: ClassroomProps) {
   useEffect(() => {
     if (!isActive) return;
 
-    let stream;
+    let stream: MediaStream | null = null;
 
     async function start() {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: true,
-      });
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: true,
+        });
+        setStream(stream);
+      } catch (error) {
+        console.error("Error accessing media devices:", error);
+      }
     }
 
     start();
@@ -163,6 +176,12 @@ export default function Classroom({ isActive, onEndSession }: ClassroomProps) {
       }
     };
   }, [isActive]);
+
+  useEffect(() => {
+    if (videoRef.current && stream && videoOn) {
+      videoRef.current.srcObject = stream;
+    }
+  }, [stream, videoOn]);
 
   const toggleMic = async () => {
     if (micOn) {
@@ -576,22 +595,27 @@ export default function Classroom({ isActive, onEndSession }: ClassroomProps) {
     try {
       setGeneratingDiagrams((prev) => ({ ...prev, [stepIndex]: true }));
 
-      const ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_GEMINI_API_KEY });
-      const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: `You are an expert SVG diagram generator. Generate raw SVG code for the following diagram description:
+      const groq = new Groq({ apiKey: import.meta.env.VITE_GROQ_API_KEY, dangerouslyAllowBrowser: true });
+      const response = await groq.chat.completions.create({
+        model: "llama-3.3-70b-versatile",
+        messages: [
+          {
+            role: "user",
+            content: `You are an expert SVG diagram generator. Generate raw SVG code for the following diagram description:
         
-        DESCRIPTION: ${prompt}
-        
-        CRITICAL: Output ONLY valid SVG code. Do not include markdown formatting like \`\`\`svg.
-        CRITICAL: Do NOT use <g> elements or transform attributes. Apply all coordinates directly to the shapes.
-        CRITICAL: Supported elements are <path>, <rect>, <circle>, <ellipse>, <line>, <text>.
-        
-        Coordinates are relative to a 800x600 canvas. Center the diagram at x:400, y:300.
-        Make it simple, clear, and colorful. Use SVG paths for complex shapes.`,
+DESCRIPTION: ${prompt}
+
+CRITICAL: Output ONLY valid SVG code. Do not include markdown formatting like \`\`\`svg.
+CRITICAL: Do NOT use <g> elements or transform attributes. Apply all coordinates directly to the shapes.
+CRITICAL: Supported elements are <path>, <rect>, <circle>, <ellipse>, <line>, <text>.
+
+Coordinates are relative to a 800x600 canvas. Center the diagram at x:400, y:300.
+Make it simple, clear, and colorful. Use SVG paths for complex shapes.`,
+          },
+        ],
       });
 
-      let svgStr = response.text?.trim() || "";
+      let svgStr = response.choices[0]?.message?.content?.trim() || "";
       // Strip markdown if present
       svgStr = svgStr.replace(/^```(xml|svg)?\n?/, "").replace(/\n?```$/, "");
 
@@ -779,7 +803,26 @@ export default function Classroom({ isActive, onEndSession }: ClassroomProps) {
       return;
     }
 
+    // Check for keywords to capture webcam
+    const webcamKeywords = ["show me", "look at", "see my", "what do you see", "can you see", "check my", "watch me", "observe"];
+    const queryLower = query.toLowerCase();
+    const hasWebcamKeyword = webcamKeywords.some(keyword => queryLower.includes(keyword));
+
     let capturedImage = image;
+    
+    // Capture webcam if keyword detected and video is on
+    if (!capturedImage && hasWebcamKeyword && videoOn && videoRef.current) {
+      const canvas = document.createElement("canvas");
+      canvas.width = videoRef.current.videoWidth;
+      canvas.height = videoRef.current.videoHeight;
+      const ctx = canvas.getContext("2d");
+      if (ctx) {
+        ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+        capturedImage = canvas.toDataURL("image/jpeg", 0.8);
+        setVoiceOnlyMode(true); // Only voice response, no whiteboard
+      }
+    }
+    
     if (!capturedImage && screenShareOn && screenVideoRef.current) {
       const canvas = document.createElement("canvas");
       canvas.width = screenVideoRef.current.videoWidth;
@@ -862,19 +905,17 @@ export default function Classroom({ isActive, onEndSession }: ClassroomProps) {
       console.warn('⚠️ AWS Lambda unavailable, using fallback:', awsError);
     }
 
-    // Fallback: Use direct Gemini API (existing code)
-    console.log('🔄 Using fallback: Direct Gemini API');
+    // Fallback: Use direct Groq API
+    console.log('🔄 Using fallback: Direct Groq API');
     try {
-      const ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_GEMINI_API_KEY });
+      const groq = new Groq({ apiKey: import.meta.env.VITE_GROQ_API_KEY, dangerouslyAllowBrowser: true });
 
-      // Use gemini-2.5-flash for fast and high-quality diagram generation
-      let selectedModel = "gemini-2.5-flash";
+      // Use llama-3.3 for fast and high-quality responses
+      let selectedModel = "llama-3.3-70b-versatile";
 
       console.log(`Using model: ${selectedModel}`);
 
-      const parts: any[] = [
-        {
-          text: `You are an AI teacher. 
+      const systemPrompt = `You are an AI teacher. 
 Current text on the board:
 \`\`\`
 ${whiteboardText}
@@ -980,43 +1021,178 @@ If MODE is "whiteboard" (and CLEAR_BOARD is true):
      - CRITICAL: Break content into small, digestible lines.
      - SPOKEN TEXT RULE: The SPOKEN text must closely match the WRITTEN text. Say EXACTLY what you are writing, plus a very brief explanation. Do NOT write one thing and speak about something else. Sync is critical.
      - CRITICAL: Do NOT move to the next line until the writing AND speaking for the current line are finished.
-     - CRITICAL FOR MATH EQUATIONS: You MUST use LaTeX syntax for mathematical equations. Enclose block equations in \`$$\` (e.g., \`$$ E = mc^2 $$\`) and inline equations in \`$\` (e.g., \`$x = 5$\`). The board will render them beautifully.
+     - CRITICAL FOR MATH EQUATIONS: For the WRITTEN board, do NOT use LaTeX or special symbols. Write everything in plain, conversational language:
+       * Instead of "$$E = mc^2$$", write "E equals m times c squared"
+       * Instead of "∫3x dx", write "the integral of 3x with respect to x"
+       * Instead of "3/2", write "three divided by two" or "three halves"
+       * Instead of "x^2", write "x squared"
+       * Instead of "→", write "approaches"
+       * Instead of "f'(x)" or "f prime", write "the derivative of f with respect to x" or "df/dx becomes d f d x"
+       * Instead of "f''(x)", write "the second derivative of f"
+       * Use only simple text that a student can read and understand immediately
+     - CRITICAL FOR SPOKEN TEXT: The SPOKEN field must NEVER include LaTeX symbols like $$ or $ or prime notation ('). When you write math in WRITTEN, convert it to natural language in SPOKEN. Example: WRITTEN: "the derivative of f with respect to x" → SPOKEN: "the derivative of f with respect to x". This ensures text-to-speech sounds natural.
   
-  CRITICAL FOR PHYSICS PROBLEMS:
+  ═══ UNIVERSAL RULE FOR ALL NUMERICAL, PHYSICS, AND MATH PROBLEMS ═══
+  THIS APPLIES TO EVERY SINGLE NUMERICAL PROBLEM, PHYSICS PROBLEM, AND MATH PROBLEM.
+  NO EXCEPTIONS. NO SPECIAL CASES.
+  
+  ABSOLUTE REQUIREMENTS:
+  1. NEVER use LaTeX symbols ($, \, ^, /, *, →, ∫, ∂, ≈, ≠, ≤, ≥, etc.)
+  2. NEVER use prime notation (f'(x), f''(x), y', etc.)
+  3. NEVER use mathematical symbols in WRITTEN text
+  4. ALWAYS use plain English conversational language
+  5. ALWAYS explain what each variable equals in each step
+  6. ALWAYS show ALL arithmetic - never skip steps
+  
+  CRITICAL FOR PHYSICS PROBLEMS (EVERY TIME):
   Follow "The Physics Structure":
   I. Setup (The Model)
-     - Givens & Goal: List known variables (v, m, theta) and what you need to find.
-     - Diagram: Draw a Free Body Diagram (FBD) or circuit schematic using DIAGRAM_PROMPT.
-     - Assumptions: State constraints (e.g., "Vacuum," "Frictionless," "Point mass").
+     - Givens & Goal: List known variables in plain language (e.g., "velocity is 5 meters per second, mass is 2 kilograms")
+     - Diagram: Draw a Free Body Diagram (FBD) or circuit schematic using DIAGRAM_PROMPT
+     - Assumptions: State constraints in plain language (e.g., "We assume no air resistance", "The surface is frictionless")
   II. The Law (The Weapon)
-     - Principle: State the governing law (e.g., Newton's 2nd Law, Conservation of Energy).
-     - Equation: Write down the base formula using LaTeX syntax (e.g., \`$$ F = ma $$\`).
+     - Principle: State the governing law in plain language (e.g., "Newton's second law states that force equals mass times acceleration")
+     - Equation: Write the formula in PLAIN LANGUAGE, NOT LaTeX
+       * Example: Instead of "F = ma", write "Force equals mass times acceleration"
+       * Example: Instead of "v = u + at", write "final velocity equals initial velocity plus acceleration times time"
   III. Execution (The Solve)
-     - Symbolic First: Isolate the target variable using algebra before plugging in any numbers.
-     - Substitute: Insert values only at the very end.
+     - Symbolic First: Isolate the target variable using algebra in plain language before plugging in numbers
+     - Substitute: Insert values with units only at the very end
+     - Show EVERY calculation step with actual numbers
+     - Use conversational language for all operations
   IV. Sanity Check
      - Units: Do the dimensions match on both sides?
-     - Limits: Does the result make sense if mass = 0 or time -> infinity?
+     - Limits: Does the result make sense if mass equals zero or time approaches infinity?
   V. Result
-     - Answer: State the value with correct significant figures and units.
-     - Meaning: Interpret the physical sign (+/-) or magnitude.
-
-  CRITICAL FOR MATH PROBLEMS:
+     - Answer: State the value with correct significant figures and units
+     - Meaning: Interpret the physical sign (positive or negative) or magnitude
+  
+  CRITICAL FOR MATH PROBLEMS (EVERY TIME):
   Follow "The Math Structure":
   I. Setup (The Premise)
-     - Given & Goal: Define the starting conditions and what to prove or find.
-     - Visual: Sketch the graph, geometric figure, or define the domain using DIAGRAM_PROMPT.
+     - Given & Goal: Define the starting conditions and what to prove or find
+     - Visual: Sketch the graph, geometric figure, or define the domain using DIAGRAM_PROMPT
   II. The Strategy (The Tool)
-     - Method: Select the specific Theorem or Technique (e.g., "Pythagorean Theorem," "Integration by Parts," "Induction").
+     - Method: Select the specific Theorem or Technique in plain language (e.g., "Pythagorean Theorem", "Integration by Parts", "Mathematical Induction")
   III. Execution (The Logic)
-     - Step-by-Step: Apply logical operators ("Since," "Therefore," "Implies").
-     - Calculation: Perform the algebraic or calculus operations clearly.
+     - Step-by-Step: Apply logical operators ("Since", "Therefore", "Implies")
+     - Calculation: Perform algebraic or calculus operations clearly in PLAIN LANGUAGE
+     - NATURAL LANGUAGE FOR MATH (MANDATORY):
+       * Instead of "v(x) = x", say "v of x equals x" or "the function v depends on x, and it equals x"
+       * Instead of "v'(x) = 1", say "the derivative of v with respect to x is 1" or "when we differentiate v, we get 1"
+       * Instead of "∫x dx", say "the integral of x with respect to x" or "when we integrate x"
+       * Instead of "f(x) → ∞", say "as x approaches infinity, f of x approaches infinity" or "f grows without bound"
+       * Instead of "x^2", say "x squared"
+       * Instead of "3/2", say "three divided by two" or "three halves"
+       * Always explain WHAT the symbol means before using it: "The derivative, which tells us the rate of change, is 1"
   IV. Verification
-     - Constraints: Check for undefined values (e.g., division by zero, negative roots).
-     - Edge Cases: Does the solution hold for x=0, x=1, or boundary conditions?
+     - Constraints: Check for undefined values (e.g., division by zero, negative roots)
+     - Edge Cases: Does the solution hold for x equals zero, x equals one, or boundary conditions?
   V. Result
-     - Conclusion: Box the final answer clearly.
-     - Q.E.D.: Mark the proof complete.
+     - Conclusion: Box the final answer clearly
+     - Mark the proof complete
+
+  ═══ STEPS — NUMERICAL PROBLEMS (APPLIES TO ALL) ═══
+  Show ALL arithmetic clearly. Never skip steps. Label each step with what you're doing.
+  CRITICAL: ALWAYS MENTION THE FORMULA FIRST IN PLAIN LANGUAGE BEFORE SOLVING.
+  CRITICAL: ALWAYS SPECIFY AND EXPLAIN ALL OPERATORS (like d/dx, integral symbol, etc.) IN PLAIN LANGUAGE.
+  
+  ALGEBRA (solve equation):
+  - FIRST: State the formula or equation in plain language (e.g., "We have the equation: 2x plus 3 equals 7")
+  - Specify each operator used: "The plus operator means addition", "The equals operator means both sides are the same value"
+  - Isolate variable step by step, showing each operation in conversational language
+  - Show intermediate values with explanations
+  - Box the final answer
+  - Example: "Formula: 2x plus 3 equals 7. Operators: plus means addition, equals means both sides are the same. Step 1: We subtract 3 from both sides (subtraction operator) to get 2x equals 4. Step 2: We divide both sides by 2 (division operator) to get x equals 2. Answer: x equals 2."
+  
+  CALCULUS (integrate/differentiate):
+  - FIRST: State the formula or rule being used in plain language (e.g., "We use the Power Rule for integration")
+  - SPECIFY THE OPERATOR: "The derivative operator d/dx means the rate of change of the function with respect to x" OR "The integral operator (the elongated S symbol) means the sum of infinitely small pieces"
+  - State the general formula: "The integral of x to the power n equals x to the power (n plus 1) divided by (n plus 1), where n is the exponent"
+  - Apply it showing each term and the value of n for that term
+  - Example: "Formula: Power Rule for integration. Operator: The integral symbol (elongated S) means we are finding the antiderivative. The integral of x to the power n equals x to the power (n plus 1) divided by (n plus 1). For the term 3x, we have n equals 1 (since x is x to the power 1). Applying the formula: 3 times x to the power 2, divided by 2, which simplifies to three halves times x squared. Final answer: three halves x squared plus C (where C is the constant of integration)."
+  - For derivatives: "Operator: d/dx means the derivative with respect to x, which tells us the rate of change. If we have v of x equals x, then d/dx of v equals 1."
+  - Simplify step by step using ONLY conversational language
+  - Box result with the constant of integration (plus C)
+  
+  PHYSICS (word problem):
+  - FIRST: State the formula in plain language (e.g., "We use Newton's second law: Force equals mass times acceleration")
+  - SPECIFY THE OPERATORS: "The times operator means multiplication", "The equals operator means both sides have the same value"
+  - Explain what each variable in the formula means
+  - Substitute known values with units, explaining each substitution
+  - Calculate step by step using conversational language
+  - State the answer with units
+  - Example: "Formula: Force equals mass times acceleration (F equals m times a). Operators: times means multiplication, equals means both sides are the same. Given: mass equals 5 kilograms, acceleration equals 2 meters per second squared. Substituting: Force equals 5 kilograms times 2 meters per second squared. Calculating: 5 times 2 equals 10. Answer: Force equals 10 Newtons."
+  
+  ARITHMETIC/NUMBER:
+  - FIRST: State the operation or formula (e.g., "We need to add two numbers: 25 plus 17")
+  - SPECIFY THE OPERATORS: "The plus operator means addition", "The equals operator means the result"
+  - Show working with actual numbers
+  - Show each calculation using conversational language
+  - Box the answer
+  - Example: "Operation: Addition of 25 plus 17. Operator: plus means we are adding. Step 1: We add 20 plus 10 (addition operator) to get 30. Step 2: We add 5 plus 7 (addition operator) to get 12. Step 3: We add 30 plus 12 (addition operator) to get 42. Answer: 42."
+  
+  TRIGONOMETRY:
+  - FIRST: State the trigonometric formula or identity in plain language (e.g., "We use the sine ratio: sine equals opposite divided by hypotenuse")
+  - SPECIFY THE OPERATORS: "The sine operator (sin) means the ratio of opposite side to hypotenuse", "The divided by operator means division"
+  - Explain what sine, cosine, tangent mean (e.g., "sine is the ratio of opposite to hypotenuse")
+  - Show angle values in degrees or radians with explanation
+  - Calculate step by step
+  - Example: "Formula: Sine of angle equals opposite divided by hypotenuse. Operators: sine (sin) is a trigonometric operator that gives the ratio, divided by means division. For a 30-degree angle in a right triangle: sine of 30 degrees equals one half. Cosine of 30 degrees equals the square root of 3 divided by 2."
+  
+  STATISTICS/PROBABILITY:
+  - FIRST: State the formula in plain language (e.g., "The mean formula is: sum of all values divided by the count of values")
+  - SPECIFY THE OPERATORS: "The sum operator (sigma or addition) means we add all values", "The divided by operator means division"
+  - Define the concept in plain language
+  - Show the formula in plain language
+  - Calculate step by step with actual numbers
+  - Explain what the result means
+  - Example: "Formula: Mean equals sum of all values divided by count. Operators: sum means we add all values together, divided by means division. Given values: 5, 10, 15. Step 1: Sum equals 5 plus 10 plus 15 equals 30. Step 2: Count equals 3. Step 3: Mean equals 30 divided by 3 equals 10. Answer: The mean is 10."
+  
+  CHEMISTRY/STOICHIOMETRY:
+  - FIRST: State the balanced chemical equation in plain language (e.g., "The reaction is: 2 hydrogen plus oxygen produces 2 water")
+  - SPECIFY THE OPERATORS: "The plus operator means reactants are combined", "The arrow operator means produces or yields"
+  - State the molar mass formula: "Molar mass equals mass divided by number of moles"
+  - Show all conversions between moles, grams, and molecules
+  - Calculate step by step
+  - Example: "Equation: 2 hydrogen molecules plus 1 oxygen molecule produces 2 water molecules. Operators: plus means the reactants combine, arrow means the reaction produces. Molar mass of water equals 18 grams per mole. If we have 36 grams of water, the number of moles equals 36 divided by 18 equals 2 moles."
+  
+  GEOMETRY:
+  - FIRST: State the formula in plain language (e.g., "The area of a rectangle equals length times width")
+  - SPECIFY THE OPERATORS: "The times operator means multiplication", "The equals operator means both sides are the same"
+  - Explain what each variable represents
+  - Substitute known values
+  - Calculate step by step
+  - Example: "Formula: Area of rectangle equals length times width. Operators: times means multiplication, equals means both sides are the same. Given: length equals 5 meters, width equals 3 meters. Calculation: Area equals 5 times 3 equals 15 square meters."
+  
+  CONVERSATIONAL OPERATOR REFERENCE (USE ALWAYS):
+  - "/" → "divided by"
+  - "*" → "times" or "multiplied by"
+  - "^" → "to the power" or "squared/cubed"
+  - "=" → "equals"
+  - "+" → "plus"
+  - "-" → "minus"
+  - ">" → "greater than"
+  - "<" → "less than"
+  - "≈" → "approximately equals"
+  - "→" → "approaches"
+  - "∫" → "the integral of"
+  - "∂" → "the partial derivative of"
+  - "√" → "the square root of"
+  - "∞" → "infinity"
+  - "π" → "pi"
+  - "e" → "e (approximately 2.718)"
+  
+  MANDATORY CHECKLIST FOR EVERY NUMERICAL PROBLEM:
+  ✓ No LaTeX symbols anywhere
+  ✓ No prime notation (f', f'', y')
+  ✓ No mathematical symbols (^, /, *, →, ∫, etc.)
+  ✓ All operators converted to conversational language
+  ✓ Every variable value explained (e.g., "n equals 1 because...")
+  ✓ Every arithmetic step shown
+  ✓ No steps skipped
+  ✓ Final answer boxed
+  ✓ Explanation sounds like a real teacher talking to a student
 
   3. CODING TASKS (COMPLEXITY CLASSIFICATION):
      - If the user asks for code, you MUST classify whether the problem is COMPLEX or SIMPLE.
@@ -1115,27 +1291,27 @@ DIAGRAM_PROMPT:
 HIGHLIGHT: 
 PERMANENT_HIGHLIGHT: 
 ===STEP===
-...
-`,
-        },
-      ];
+...`;
 
-      if (capturedImage) {
-        // Remove data URL prefix
-        const base64Data = capturedImage.split(",")[1];
-        parts.push({
-          inlineData: {
-            mimeType: "image/jpeg",
-            data: base64Data,
-          },
-        });
-      }
+      const userMessage = capturedImage 
+        ? `${query}\n\n[Image provided by user]`
+        : query;
 
       const currentSessionId = sessionIdRef.current;
 
-      const responseStream = await ai.models.generateContentStream({
+      const stream = await groq.chat.completions.create({
         model: selectedModel,
-        contents: [{ role: "user", parts: parts }],
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt,
+          },
+          {
+            role: "user",
+            content: userMessage,
+          },
+        ],
+        stream: true,
       });
 
       let fullText = "";
@@ -1202,13 +1378,13 @@ PERMANENT_HIGHLIGHT:
         };
       };
 
-      for await (const chunk of responseStream) {
+      for await (const chunk of stream) {
         if (currentSessionId !== sessionIdRef.current) {
           console.log("Session changed, aborting stream processing.");
           return;
         }
 
-        fullText += chunk.text;
+        fullText += chunk.choices[0]?.delta?.content || "";
 
         if (!chatActionParsed) {
           const actionMatch = fullText.match(/CHAT_ACTION:\s*(.*?)(?=\n|$)/i);
@@ -1222,9 +1398,9 @@ PERMANENT_HIGHLIGHT:
         if (!modeParsed) {
           const modeMatch = fullText.match(/MODE:\s*(whiteboard|code)/i);
           if (modeMatch) {
-            setPresentationMode(
-              modeMatch[1].toLowerCase() as "whiteboard" | "code",
-            );
+            // Override to "none" if in voice-only mode (webcam keyword detected)
+            const mode = voiceOnlyMode ? "none" : (modeMatch[1].toLowerCase() as "whiteboard" | "code");
+            setPresentationMode(mode);
             modeParsed = true;
           }
         }
@@ -1296,6 +1472,7 @@ PERMANENT_HIGHLIGHT:
           if (completeSteps.length > 0) {
             setSteps(completeSteps);
             setIsProcessing(false);
+            setVoiceOnlyMode(false);
           }
         }
       }
@@ -1352,6 +1529,7 @@ PERMANENT_HIGHLIGHT:
       }
 
       setIsProcessing(false);
+      setVoiceOnlyMode(false);
     } catch (error: any) {
       if (
         error?.type === "cancelation" ||
@@ -1369,6 +1547,7 @@ PERMANENT_HIGHLIGHT:
         },
       ]);
       setIsProcessing(false);
+      setVoiceOnlyMode(false);
     }
   };
 
@@ -1734,6 +1913,7 @@ PERMANENT_HIGHLIGHT:
 
         <div className="flex items-center gap-2 md:gap-3 w-full md:w-2/4 justify-center flex-wrap relative">
           <AudioVisualizer stream={stream} isListening={micOn} />
+          <AIAudioVisualizer isSpeaking={isGreetingSpeaking || (speechProgress > 0 && speechProgress < 1)} speechProgress={isGreetingSpeaking ? 0.5 : speechProgress} />
           <button
             onClick={toggleMic}
             className={`p-3 rounded-full ${micOn ? "bg-red-600 hover:bg-red-700 animate-pulse" : "bg-[#3c4043] hover:bg-[#4d5155]"} text-white transition-colors relative`}
@@ -1780,7 +1960,7 @@ PERMANENT_HIGHLIGHT:
 
           <button
             onClick={toggleScreenShare}
-            className={`hidden md:block p-3 rounded-full ${screenShareOn ? "bg-blue-600 hover:bg-blue-700 animate-pulse" : "bg-[#3c4043] hover:bg-[#4d5155]"} text-white transition-colors`}
+            className={`hidden p-3 rounded-full ${screenShareOn ? "bg-blue-600 hover:bg-blue-700 animate-pulse" : "bg-[#3c4043] hover:bg-[#4d5155]"} text-white transition-colors`}
             title={screenShareOn ? "Stop Sharing Screen" : "Share Screen"}
           >
             <MonitorUp className="w-5 h-5" />
